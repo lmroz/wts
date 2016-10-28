@@ -101,6 +101,11 @@ func (a ByStart) Len() int           { return len(a) }
 func (a ByStart) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByStart) Less(i, j int) bool { return a[i].Start.Before(a[j].Start) }
 
+const (
+	workDay8  = time.Hour * 8
+	workDay64 = (time.Hour * 64) / 10
+)
+
 func main() {
 	getLogouts()
 	getLogins()
@@ -113,9 +118,18 @@ func main() {
 	}
 
 	sort.Sort(withBoth)
-
+	var balance8, balance64 time.Duration
 	for _, period := range withBoth {
-		fmt.Println(period, "\t", period.Stop.Sub(period.Start))
+		duration := period.Stop.Sub(period.Start)
+		balance8 += duration - workDay8
+		balance64 += duration - workDay64
+		fmt.Printf("%v - %v%15v%15v%15v\n",
+			period.Start.Format(time.ANSIC),
+			period.Stop.Format(time.ANSIC),
+			duration,
+			balance8,
+			balance64,
+		)
 	}
 
 }
