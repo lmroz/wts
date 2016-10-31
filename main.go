@@ -1,135 +1,118 @@
 package main
 
 import (
-	"bufio"
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
-	"os/user"
-	"path/filepath"
-	"sort"
-	"strings"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/alexflint/go-filemutex"
+	"github.com/godbus/dbus"
 )
-
-type (
-	Day struct {
-		Y, M, D int
-	}
-
-	Period struct {
-		Start, Stop time.Time
-	}
-)
-
-var detected = map[Day]Period{}
-
-// it works just due to some bug in ubuntu and perhaps because of logrotate freq.
-func getLogouts() {
-	cu, err := user.Current()
-	if err != nil {
-		panic(err)
-	}
-	upstartCache := filepath.Join(
-		cu.HomeDir,
-		".cache/upstart",
-	)
-	filez, err := ioutil.ReadDir(upstartCache)
-	if err != nil {
-		panic(err)
-	}
-	for _, f := range filez {
-		if n := f.Name(); strings.HasPrefix(n, "unity-panel-service-lockscreen.log.") &&
-			strings.HasSuffix(n, ".gz") {
-			t := f.ModTime()
-			Y, M, D := t.Date()
-			key := Day{Y, int(M), D}
-			val := detected[key]
-			val.Stop = t
-			detected[key] = val
-		}
-	}
-}
-
-func getLogins() {
-	logz := "/var/log"
-	filez, err := ioutil.ReadDir(logz)
-	if err != nil {
-		panic(err)
-	}
-	for _, f := range filez {
-		if n := f.Name(); strings.HasPrefix(n, "auth.log") &&
-			!strings.HasSuffix(n, ".gz") { // now i dont need such old stuff
-			stream, err := os.Open(filepath.Join(logz, n))
-			if err != nil {
-				panic(err)
-			}
-			defer stream.Close()
-			scanner := bufio.NewScanner(stream)
-			for scanner.Scan() {
-				if !strings.Contains(scanner.Text(), "gkr-pam: unlocked login keyring") {
-					continue
-				}
-				t, err := time.ParseInLocation(time.Stamp,
-					strings.Join(strings.Fields(scanner.Text())[:3], " "),
-					time.Local,
-				)
-
-				if err != nil {
-					panic(err)
-				}
-
-				t = t.AddDate(f.ModTime().Year(), 0, 0) // timestamp has no year
-				Y, M, D := t.Date()
-				key := Day{Y, int(M), D}
-				val := detected[key]
-				if !val.Start.IsZero() && val.Start.Before(t) {
-					continue
-				}
-				val.Start = t
-				detected[key] = val
-
-			}
-
-		}
-	}
-}
-
-type ByStart []Period
-
-func (a ByStart) Len() int           { return len(a) }
-func (a ByStart) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByStart) Less(i, j int) bool { return a[i].Start.Before(a[j].Start) }
 
 const (
-	workDay8  = time.Hour * 8
-	workDay64 = (time.Hour * 64) / 10
+	lockfile = "/tmp/lmroz_wts.lock"
+	logfile  = "$HOME/locklog"
 )
 
-func main() {
-	getLogouts()
-	getLogins()
+var logfileEE = os.ExpandEnv(logfile)
 
-	withBoth := ByStart{}
-	for _, period := range detected {
-		if !period.Start.IsZero() && !period.Stop.IsZero() {
-			withBoth = append(withBoth, period)
+const DBUS_ENV = "DBUS_SESSION_BUS_ADDRESS"
+
+var timeFormat = time.RFC1123Z
+
+func writeEvent(a ...interface{}) {
+	f, err := os.OpenFile(logfileEE, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error opening event file:", err)
+		return
+	}
+	_, err = fmt.Fprintln(f, a...)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error writing event file:", err)
+		return
+	}
+	defer func() {
+		err := f.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error closing event file:", err)
+			return
+		}
+	}()
+
+}
+
+// this function requires DBUS_SESSION_BUS_ADDRESS to be set in env, sometimes
+// its not set, and this is really hard to get why events are not collected
+func service() {
+	if _, ok := os.LookupEnv(DBUS_ENV); !ok {
+		panic(DBUS_ENV + " env var not set")
+	}
+
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	conn.BusObject().Call("org.freedesktop.DBus.AddMatch", 0,
+		"type='signal',path='/com/canonical/Unity/Session',interface='com.canonical.Unity.Session'")
+	c := make(chan *dbus.Signal, 10)
+	conn.Signal(c)
+	for v := range c {
+		nowStr := time.Now().Format(timeFormat)
+
+		switch v.Name {
+		case "com.canonical.Unity.Session.Locked":
+			writeEvent("LOCKED", nowStr)
+		case "com.canonical.Unity.Session.Unlocked":
+			writeEvent("UNLOCKED", nowStr)
 		}
 	}
+}
 
-	sort.Sort(withBoth)
-	var balance8, balance64 time.Duration
-	for _, period := range withBoth {
-		duration := period.Stop.Sub(period.Start)
-		balance8 += duration - workDay8
-		balance64 += duration - workDay64
-		fmt.Printf("%v - %v%15v%15v%15v\n",
-			period.Start.Format(time.ANSIC),
-			period.Stop.Format(time.ANSIC),
-			duration,
-			balance8,
-			balance64,
-		)
+func lock() func() {
+	m, err := filemutex.New(lockfile)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Fprintln(os.Stderr, "Waiting for ", lockfile)
+	m.Lock()
+	fmt.Fprintln(os.Stderr, "Lock acquired:", lockfile)
+
+	unlock := func() {
+		m.Unlock()
+		fmt.Fprintln(os.Stderr, "Lock released:", lockfile)
 	}
 
+	sigs := make(chan os.Signal)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGPIPE, syscall.SIGKILL)
+
+	go func() {
+		<-sigs
+		unlock()
+		os.Exit(1)
+	}()
+
+	return unlock
+
+}
+
+var flagTool = flag.Bool("tool", false, "True runs tool mode (shows log).")
+var flagFallback = flag.Bool("fallback", false, "True runs tool mode using fallback technique.")
+
+func main() {
+	flag.Parse()
+
+	if *flagTool || *flagFallback {
+		toolMode(*flagFallback)
+		return
+	}
+
+	unlock := lock()
+	defer unlock()
+
+	service()
 }
